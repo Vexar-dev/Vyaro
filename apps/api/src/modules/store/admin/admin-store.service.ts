@@ -47,11 +47,14 @@ export class AdminStoreService {
     if (selfId != null && parentId === selfId) throw new BadRequestException({ code: 'CATEGORY_CYCLE', message: 'لا يمكن أن يكون القسم أباً لنفسه' });
     const parent = await this.prisma.productCategory.findUnique({ where: { id: parentId } });
     if (!parent) throw new NotFoundException({ code: 'CATEGORY_NOT_FOUND', message: 'القسم الأب غير موجود' });
-    // two levels are enough for the UI (games > PUBG); also prevents cycles
-    if (parent.parentId != null) throw new BadRequestException({ code: 'CATEGORY_DEPTH', message: 'مستويان فقط: قسم رئيسي ثم قسم فرعي' });
-    if (selfId != null) {
-      const kids = await this.prisma.productCategory.count({ where: { parentId: selfId } });
-      if (kids > 0) throw new BadRequestException({ code: 'CATEGORY_DEPTH', message: 'هذا القسم عنده أقسام فرعية فلا يمكن جعله فرعياً' });
+    // any depth, but walk up the chain: no cycles, and a sane limit
+    let cur: bigint | null = parent.parentId;
+    let depth = 2;
+    while (cur != null) {
+      if (selfId != null && cur === selfId) throw new BadRequestException({ code: 'CATEGORY_CYCLE', message: 'لا يمكن جعل القسم فرعاً من أحد أقسامه الفرعية' });
+      const up = await this.prisma.productCategory.findUnique({ where: { id: cur }, select: { parentId: true } });
+      cur = up?.parentId ?? null;
+      if (++depth > 8) throw new BadRequestException({ code: 'CATEGORY_DEPTH', message: 'عدد المستويات كبير جداً' });
     }
   }
 

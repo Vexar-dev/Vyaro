@@ -50,7 +50,7 @@ function ImportInner() {
   const allSel = selectable.length > 0 && selectable.every((i) => sel.has(i.sku));
   const toggle = (sku: string) => setSel((s) => { const n = new Set(s); n.has(sku) ? n.delete(sku) : n.add(sku); return n; });
   const toggleAll = () => setSel((s) => { const n = new Set(s); selectable.forEach((i) => (allSel ? n.delete(i.sku) : n.add(i.sku))); return n; });
-  const catName = (c: Cat) => (c.parentId ? `${cats.find((p) => p.id === c.parentId)?.name ?? ''} / ${c.name}` : c.name);
+  const catName = (c: Cat): string => { const p = c.parentId ? cats.find((x) => x.id === c.parentId) : undefined; return p ? `${catName(p)} / ${c.name}` : c.name; };
 
   async function run() {
     if (!sel.size) return toast('اختر خدمة واحدة على الأقل', 'error');
