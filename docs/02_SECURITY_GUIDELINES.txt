@@ -1,0 +1,109 @@
+VAYRO — 02_SECURITY_GUIDELINES.txt
+====================================
+يوثّق هذا الملف ما هو **مُنفَّذ فعليًا** في Phase 2. أي بند مذكور هنا كـ"لاحقًا"
+غير موجود بعد في الكود.
+
+────────────────────────────────────────
+1. Password Hashing
+────────────────────────────────────────
+- Argon2id عبر مكتبة `argon2` (auth.service.ts). لا MD5/SHA1/SHA256 مباشرة.
+- لا يوجد أي "تشفير" (encryption) لكلمات المرور — hashing فقط، بلا إمكانية استرجاع.
+
+────────────────────────────────────────
+2. Secrets Management
+────────────────────────────────────────
+- EncryptionService (AES-256-GCM) هي الوحيدة المخوّلة بالتعامل مع المفتاح الرئيسي.
+- المفتاح الرئيسي: من ENV فقط (ENCRYPTION_KEY) في التطوير — غير مخزَّن في MySQL إطلاقًا.
+- provider_credentials.encrypted_value يخزّن نص مشفّر فقط (IV:authTag:ciphertext).
+- الإنتاج: استبدال getMasterKey بمصدر KMS/Secrets Manager — نقطة تغيير واحدة فقط.
+- .env غير مرفوع لِGit (.gitignore). .env.example بلا أي قيمة حقيقية.
+
+────────────────────────────────────────
+3. Authentication & Sessions
+────────────────────────────────────────
+- Access Token: JWT، صلاحية قصيرة (افتراضي 15 دقيقة)، لا يُخزَّن في قاعدة البيانات.
+- Refresh Token: 64 بايت عشوائي (crypto.randomBytes)، يُخزَّن كـ SHA-256 hash فقط
+  في جدول sessions.refresh_token_hash — أبدًا كنص صريح.
+- Refresh Token Rotation: كل استخدام لـ refresh token يُصدر واحدًا جديدًا ويُبطل
+  القديم (session.revokedAt + replacedBySessionId) — انظر TokensService.rotate().
+- Replay Detection: إعادة استخدام refresh token مُبطَل بالفعل تُبطل كل جلسات
+  المستخدم النشطة دفاعيًا (TokensService.rotate، حالة REFRESH_TOKEN_REPLAY).
+- Refresh Token يُرسَل فقط كـ Secure HttpOnly Cookie (auth.controller.ts)،
+  Path مقيّد بـ /auth، SameSite=lax، Secure=true في production.
+- Login Protection: تتبّع محاولات الدخول الفاشلة (failed_login_count)، قفل الحساب
+  15 دقيقة بعد 5 محاولات فاشلة متتالية (MAX_FAILED_LOGINS في auth.service.ts).
+- رسائل الخطأ عامة (INVALID_CREDENTIALS) بغضّ النظر عن كون الحساب موجودًا أو
+  كلمة المرور خاطئة — لا كشف لوجود الحساب.
+- Password Reset: token عشوائي 32 بايت، يُخزَّن كـ hash فقط، صالح لمرة واحدة،
+  ينتهي بعد 30 دقيقة، ويُبطل كل الجلسات النشطة عند نجاح إعادة التعيين.
+
+────────────────────────────────────────
+4. Authorization (RBAC)
+────────────────────────────────────────
+- 4 أدوار: USER, SUPPORT, ADMIN, SUPER_ADMIN (roles.code enum).
+- RolesGuard + PermissionsGuard مطبّقان على مستوى الخادم (common/guards/roles.guard.ts)
+  — وليس فقط إخفاء عناصر واجهة.
+- كل Route محمي افتراضيًا عبر JwtAuthGuard (مسجّل كـ APP_GUARD عام)؛ @Public()
+  هو الاستثناء الصريح الوحيد (auth/login, auth/register, health...).
+- Permissions فعلية حاليًا: users.view, users.freeze, providers.manage,
+  settings.manage (seed.ts) — تُوسَّع مع كل Phase لاحقة.
+
+────────────────────────────────────────
+5. IDOR Protection
+────────────────────────────────────────
+- كل مسارات /users/me/* تشتق المستخدم من الـ JWT المُتحقَّق منه (publicId)،
+  وليس من أي معرّف يرسله العميل.
+- إلغاء جلسة (DELETE /users/me/sessions/:id) يتحقق من ملكية الجلسة فعليًا
+  (session.userId === caller.id) قبل أي تعديل؛ في حال عدم الملكية تُعاد نفس
+  رسالة 404 المستخدمة لو لم توجد الجلسة أصلًا — لا تسريب لوجودها (users.service.ts).
+- اختبار مكرَّس لهذا السلوك: test/security/idor-sessions.spec.ts.
+
+────────────────────────────────────────
+6. Input Validation
+────────────────────────────────────────
+- كل DTO مزوّد بـ class-validator (auth/dto, users/dto).
+- ValidationPipe عام: whitelist + forbidNonWhitelisted (main.ts) — أي حقل غير
+  متوقع من العميل يُرفض، لا يُمرَّر بصمت.
+- Username: صيغة صارمة a-z0-9_ فقط (يمنع Unicode confusables بالبناء)، طول 3-20،
+  لا يبدأ برقم/شرطة سفلية، لا شرطات سفلية متتالية (username-policy.ts).
+
+────────────────────────────────────────
+7. Rate Limiting
+────────────────────────────────────────
+- @nestjs/throttler: حد عام 100 طلب/دقيقة لكل IP (app.module.ts).
+- حدود أضيق على المسارات الحساسة: /auth/login (5/دقيقة)،
+  /auth/password/forgot (3/دقيقة) — auth.controller.ts.
+
+────────────────────────────────────────
+8. Error Handling & Logging
+────────────────────────────────────────
+- AllExceptionsFilter مركزي: لا Stack Trace ولا رسالة داخلية تصل للعميل أبدًا،
+  فقط { success:false, error:{code,message} } + requestId.
+- التفاصيل الكاملة تُسجَّل داخليًا فقط، وبدون تضمين أي جسم طلب (قد يحوي كلمات مرور).
+- RequestIdMiddleware يربط كل طلب بمعرّف واحد قابل للتتبع عبر السجلات والاستجابة.
+- ممنوع تسجيل: كلمات المرور، الـ Tokens، الأسرار، مفاتيح الـ API، OTP — لا يوجد
+  أي console.log لأي من هذه القيم في الكود الحالي.
+
+────────────────────────────────────────
+9. Security Headers / CORS
+────────────────────────────────────────
+- helmet() مفعّل على مستوى التطبيق كاملًا (main.ts).
+- CORS: أصول محددة صراحة عبر CORS_ORIGINS في production، مفتوح فقط في التطوير
+  المحلي — أبدًا "*" في production.
+
+────────────────────────────────────────
+10. Financial Precision (تجهيزًا للمراحل القادمة)
+────────────────────────────────────────
+- Money/MoneyMath/FeeCalculator (common/money/): كل الحسابات المالية عبر
+  BigInt minor-units فقط. لا FLOAT/DOUBLE، ولا `amount * percentage` مباشر
+  في أي مكان بالكود.
+- هذا جاهز الآن لكنه غير مربوط بعد بأي تدفق مالي فعلي — ذلك يبدأ في Phase 3.
+
+────────────────────────────────────────
+11. ما لم يُنفَّذ بعد (Not yet implemented — Phase 2 scope only)
+────────────────────────────────────────
+- 2FA (TOTP): الجدول two_factor_secrets موجود، endpoint التفعيل الفعلي غير مكتوب بعد.
+- Email/Phone verification: الحقول موجودة (email_verified_at)، لا خدمة إرسال بريد حقيقية بعد.
+- Wallet/Ledger business logic: الجداول موجودة، الخدمات (WalletService, LedgerService) غير مكتوبة (Phase 3).
+- Webhook signature verification: لا يوجد أي webhook فعلي بعد — لا مزودين حقيقيين مربوطين.
+- Admin 2FA enforcement, IP/device restrictions: مؤجلة لـ Phase 9 (Admin Dashboard).

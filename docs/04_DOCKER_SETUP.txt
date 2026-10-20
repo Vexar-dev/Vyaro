@@ -1,0 +1,75 @@
+VAYRO — 04_DOCKER_SETUP.txt
+=============================
+القرار: Docker Compose مُستخدَم (مُقرَّر في Phase 1 وثابت في Phase 2).
+السبب: المشروع Multi-service فعليًا (API + MySQL + Redis + Worker) ويحتاج بيئة
+تطوير موحّدة بين أعضاء الفريق. لم يُستخدم Kubernetes الآن (تعقيد غير مبرر بهذا الحجم).
+
+────────────────────────────────────────
+الخدمات (docker/docker-compose.yml)
+────────────────────────────────────────
+- mysql (mysql:8.0): MYSQL_USER/MYSQL_PASSWORD من .env — التطبيق لا يتصل بـ root.
+  Healthcheck: mysqladmin ping.
+- redis (redis:7-alpine): Healthcheck: redis-cli ping.
+- api: يُبنى من apps/api/Dockerfile (multi-stage: build ثم runtime، يعمل كمستخدم
+  node غير root داخل الحاوية). ينتظر mysql/redis عبر `condition: service_healthy`
+  قبل الإقلاع. Healthcheck: GET /api/v1/health.
+- worker: نفس صورة الـ API لكن بأمر تشغيل مختلف (dist/worker.js). حاليًا **placeholder
+  فعلي وليس وهميًا مموَّهًا** — src/worker.ts لا يسجّل أي طابور بعد (لا Provider
+  حقيقي بعد لمعالجة webhooks)، لذا هو فعليًا "ينتظر" دون تنفيذ أي شيء غير آمن أو مصطنع.
+
+────────────────────────────────────────
+التشغيل
+────────────────────────────────────────
+  docker compose up -d
+  docker compose ps        # تحقق من الحالة الصحية
+  docker compose logs -f api
+
+────────────────────────────────────────
+لماذا لا يوجد Dockerfile لـ apps/web بعد؟
+────────────────────────────────────────
+واجهة Phase 2 (Next.js) لا تزال بحاجة تطويرًا سريعًا ومتكررًا (Phases قادمة كثيرة
+ستضيف صفحات). تُشغَّل حاليًا عبر `npm run dev` محليًا خارج Docker لتسريع التطوير؛
+سيُضاف Dockerfile للواجهة عند اقتراب الإنتاج الفعلي (على الأرجح قرب Phase 9-10)
+لتفادي إعادة بناء صورة كاملة على كل تعديل واجهة أثناء التطوير النشط.
+
+────────────────────────────────────────
+أمان الحاويات
+────────────────────────────────────────
+- لا يستخدم التطبيق مستخدم MySQL root (MYSQL_USER مخصص بصلاحيات على قاعدة vayro فقط).
+- حاوية الـ API تعمل كمستخدم `node` غير root (Dockerfile: USER node).
+- لا أسرار داخل أي طبقة Docker image — كلها تُمرَّر عبر env_file عند التشغيل فقط.
+
+────────────────────────────────────────
+تحديث (بعد Phase 2): إصلاح خطأ "Cannot find module '@nestjs/core'"
+────────────────────────────────────────
+السبب: مرحلة runtime في Dockerfile كانت تُشغّل `npm ci --omit=dev` مستقلة، قبل
+نسخ apps/api/package.json إلى تلك المرحلة. مع npm workspaces، هذا يمنع npm من
+تحديد أن @nestjs/core تبعية production فعلية لـ apps/api، فيُسقِطها بصمت.
+
+الإصلاح: تثبيت واحد فقط (كامل، مع devDependencies) في مرحلة build بعد نسخ
+package.json الخاص بكل workspace أولًا، ثم `npm prune --omit=dev` على نفس
+node_modules، ثم نسخ الناتج المُقلَّم جاهزًا لمرحلة runtime — بلا أي تثبيت ثانٍ.
+
+أُضيف أيضًا: `apk add openssl` (لازم لمحرك Prisma على Alpine وقت التشغيل أيضًا،
+وليس فقط وقت `prisma generate`)، و`apk add python3 make g++` في مرحلة البناء فقط
+(لازم لتصريف الإضافة الأصلية لمكتبة argon2 على Alpine).
+
+────────────────────────────────────────
+تحديث ٢: المحاولة السابقة (npm ci --workspace + prune) لم تحلّ المشكلة فعليًا
+────────────────────────────────────────
+نفس خطأ "Cannot find module '@nestjs/core'" استمر رغم الإصلاح السابق. دليل إضافي
+مهم: خدمة worker عملت بنجاح (Up) رغم أنها من نفس الصورة — لأن worker.ts الحالي
+لا يستورد أي حزمة NestJS إطلاقًا (console.log فقط)، فلم تكشف المشكلة. هذا يؤكد أن
+العطل مقتصر على وجود @nestjs/core في node_modules المنسوخة لصورة الـ runtime، لا
+على أي شيء آخر في main.js نفسه.
+
+التغيير النهائي: التخلي عن أي علم "ذكي" (--workspace, npm prune) لصالح
+`npm ci` عادي وكامل بلا فلترة، ثم نسخ node_modules **كاملة كما هي** (بلا تقليم)
+إلى صورة الـ runtime. الحجم أكبر قليلًا لكن السلوك متوقّع ومضمون. كما أُضيفت 3
+نقاط تحقق (`node -e "require.resolve(...)"`) تُفشل الـ build نفسه فورًا لو
+@nestjs/core أو dist/src/main.js غير قابلين للحل — بدل اكتشاف ذلك من خلال حلقة
+restart في الحاوية.
+
+مهم عند إعادة البناء: استخدم `--no-cache` للتأكد من عدم استخدام طبقات قديمة من
+Dockerfile السابق:
+  docker compose build --no-cache api worker

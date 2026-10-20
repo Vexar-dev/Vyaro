@@ -1,0 +1,357 @@
+VAYRO — 05_APIS_AND_PROVIDERS.txt
+====================================
+هذا الملف يوثّق بنية الـ Provider Adapter. لا يوجد أي Provider حقيقي مربوط
+بعد — لم تُستلَم أي توثيقات API حقيقية حتى كتابة هذا الملف (Phase 5).
+
+────────────────────────────────────────
+1. الحالة الحالية (Phase 5 — مكتملة)
+────────────────────────────────────────
+- src/modules/providers/provider-adapter.interface.ts: العقود (Interfaces)
+  مقسّمة حسب القدرة (Capability) لا عقد واحد ضخم:
+    ProviderAdapter        — code فقط (كل Adapter عنده هذا).
+    OrderCapableProvider   — createOrder / checkOrder / cancelOrder.
+    BalanceCapableProvider — getBalance.
+    WebhookCapableProvider — verifyWebhookSignature / handleWebhook.
+  أي Adapter يطبّق فقط القدرات التي تنطبق عليه فعليًا.
+
+- src/modules/providers/provider-registry.service.ts: ProviderRegistry —
+  الجهة الوحيدة التي تربط providers.code بنسخة الـ Adapter. أي منطق أعمال
+  مستقبلي (Deposits, Store, ...) يستدعي adapter عبر registry.get(code) فقط،
+  لا يستورد أي Adapter class مباشرة أبدًا.
+
+- src/modules/providers/provider-log.service.ts: ProviderLogService —
+    assertActiveProvider(code)  → يمنع استدعاء أي Provider DISABLED/ARCHIVED.
+    logCall(params, fn)         → يكتب سطر provider_logs واحد لكل استدعاء
+                                   (نجاح أو فشل) — هذا ما ستقرأه شاشة "Provider
+                                   Logs" في Admin (Phase 9) لاحقًا.
+    recordWebhookEvent(...)     → idempotency فعلي على مستوى قاعدة البيانات
+                                   (UNIQUE على provider_id + event_id بجدول
+                                   webhook_events) — نفس نمط
+                                   TransactionsService.createIdempotent تمامًا.
+    markWebhookProcessed(id)    → يعلّم الحدث كمُعالَج بعد تطبيق أثره.
+
+- src/modules/providers/adapters/mock/mock-provider.adapter.ts:
+  MockProviderAdapter — تطبيق حقيقي وفعّال (ليس placeholder فارغ) لكل من
+  OrderCapableProvider وWebhookCapableProvider، لا يتصل بأي API خارجي:
+    createOrder  → يُنشئ providerOrderId وهمي بحالة PENDING (في الذاكرة).
+    checkOrder   → يُرجع الحالة الحالية، أو FAILED إذا كان الـ id غير معروف.
+    cancelOrder  → يُلغي فقط إذا كانت الحالة PENDING.
+    _devMarkCompleted → أداة اختبار فقط (غير مكشوفة عبر HTTP) لمحاكاة اكتمال
+                        غير متزامن من طرف المزود.
+    verifyWebhookSignature → HMAC-SHA256 حقيقي على الـ body الخام، بمفتاح يُقرأ
+                        عبر SecretsService.getCredential(providerId,
+                        'webhook_secret') — إن لم يوجد مفتاح مُسجَّل، يُرفَض
+                        التوقيع (لا قبول افتراضي لأي webhook غير موقَّع).
+  محدودية معروفة ومقصودة: حالة الطلبات تعيش بالذاكرة فقط (Map) — لا تصمد بعد
+  إعادة تشغيل السيرفر ولا تُشارَك بين عدة نسخ منه. أي Adapter حقيقي مستقبلي
+  يجب أن يعتمد على حالة المزود نفسه + جداول orders/transactions (Phase 8)،
+  وليس ذاكرة محلية — هذا سلوك مقبول للـ Mock فقط.
+
+- src/modules/providers/providers.module.ts: يُسجّل MockProviderAdapter في
+  ProviderRegistry عبر onModuleInit(). إضافة Provider حقيقي لاحقًا (Phase
+  6/7): كتابة Adapter class جديد يطبّق الواجهة المناسبة + سطر تسجيل واحد هنا
+  — لا شيء آخر في المشروع يتغيّر.
+
+- جداول جديدة أُضيفت إلى schema.prisma (migration إضافية، لا تمس بيانات
+  موجودة):
+    provider_logs   — سجل كل استدعاء Adapter (طلب/استجابة/نجاح/خطأ).
+    webhook_events  — UNIQUE(provider_id, event_id) لمنع معالجة أي webhook
+                       مرتين.
+  يجب تطبيقها محليًا عبر:
+    cd apps/api && npx prisma migrate dev --name add_provider_logs_and_webhook_events
+
+- seed.ts: أُضيف صف Provider رابع بكود "mock"، النوع "other"، الحالة ACTIVE —
+  هذا الوحيد الذي له Adapter فعلي يعمل. shamcash/syriatel/usdt-custody تبقى
+  DISABLED كما كانت (لا Adapter لها بعد، بانتظار التوثيق الحقيقي).
+
+- اختبارات: test/unit/providers/providers.spec.ts — تغطي ProviderRegistry
+  (تسجيل/تكرار/عدم وجود)، MockProviderAdapter (دورة حياة الطلب، توقيع صحيح/
+  خاطئ/غائب)، ProviderLogService (منع استدعاء provider غير ACTIVE، كتابة
+  السجل بالنجاح والفشل، idempotency فعلي لتكرار نفس الـ webhook event).
+
+────────────────────────────────────────
+2. خطة إضافة Provider حقيقي (عند استلام التوثيق)
+────────────────────────────────────────
+  1. قراءة التوثيق كاملًا: Authentication, Endpoints, Request/Response,
+     Webhooks, Error codes, Rate limits, Idempotency, Signature verification,
+     Timeout behavior.
+  2. إنشاء src/modules/providers/adapters/<name>/ بملف Adapter يطبّق
+     العقد(العقود) المناسبة من provider-adapter.interface.ts.
+  3. تسجيل بيانات الاعتماد عبر SecretsService.setCredential (مشفّرة دائمًا).
+  4. تحديث providers.status إلى ACTIVE لهذا الـ code فقط (Admin action لاحقًا
+     في Phase 9؛ يدويًا عبر seed/DB حتى ذلك الحين).
+  5. إضافة سطر تسجيل واحد في ProvidersModule (constructor + register()).
+  6. ربط provider_services (سيُضاف عند الحاجة الفعلية — Phase 8 عند بناء
+     Product → Service → Provider) — لا فائدة من جدول ربط بلا خدمة حقيقية له.
+  7. لا تعديل على Core Business Logic (Wallet/Transactions/Transfers) بسبب
+     Provider واحد — كل التكامل يمر عبر ProviderRegistry فقط.
+
+────────────────────────────────────────
+3. إزالة/تعطيل Provider
+────────────────────────────────────────
+- تعطيل: providers.status = 'DISABLED' (Admin action، Phase 9).
+- أرشفة: providers.status = 'ARCHIVED' — يبقى مرئيًا في السجلات التاريخية فقط.
+- حذف فعلي: غير مسموح به إذا وُجدت provider_credentials أو provider_logs أو
+  webhook_events أو أي order مرتبطة — مفروض على مستوى قاعدة البيانات
+  (ON DELETE RESTRICT)، وليس فقط تحقق بالكود.
+
+────────────────────────────────────────
+4. ممنوعات لهذه المرحلة (مؤكَّدة، لم تُنتهَك)
+────────────────────────────────────────
+- لا Private Keys ولا عناوين USDT عشوائية أُنشئت.
+- لا API credentials وهمية على أنها حقيقية في .env.example أو seed.ts.
+- لا اتصال فعلي بأي API خارجي في الكود الحالي — MockProviderAdapter محلي
+  بالكامل عن قصد.
+- shamcash/syriatel/usdt-custody بقيت DISABLED بلا Adapter — لم يُفترَض أي
+  شكل لـ API حقيقي لها قبل استلام التوثيق.
+
+────────────────────────────────────────
+5. Sham Cash + Syriatel Cash (TSA API) — Phase 6/7, مبني فعليًا الآن
+────────────────────────────────────────
+بُني اعتمادًا على توثيق TSA API (tsa-api.com) الذي زوّدتني به — REST بسيط،
+Base URL واحد https://tsa-api.com/api/v1، مصادقة بترويسة X-Api-Key، وشكل خطأ
+موحّد {success:false, error:"..."}.
+
+- adapters/tsa/tsa-http-client.ts: عميل HTTP منخفض المستوى مشترك بين الاثنين
+  (نفس Base URL/المصادقة/شكل الخطأ). يستخدم fetch المدمجة في Node — لا اعتماد
+  جديد أُضيف.
+- adapters/tsa/tsa-errors.ts:
+    TsaApiError            — رفض مؤكّد (400/401/403/404/405/429 أو خطأ نظيف)
+                              — العملية أكيد لم تحدث، إعادة المحاولة آمنة.
+    TsaAmbiguousOutcomeError — فقط لاستدعاءات نقل الأموال (transfer/
+                              transfer_cash/mobile_recharge) عند فشل شبكة أو
+                              5xx — العملية قد تكون نجحت فعليًا عند TSA رغم
+                              الخطأ.
+- adapters/tsa/shamcash.adapter.ts: BalanceCapableProvider +
+  OrderCapableProvider. getBalance (USD/SYP/EUR)، createOrder (transfer)،
+  checkOrder/cancelOrder (عبر find_tx — التحويل يُسوَّى فورًا، لا حالة PENDING
+  حقيقية)، resolveRecipient (تحقق الاسم قبل التحويل — استخدمه دائمًا في أي
+  واجهة تحويل)، listIncoming (للاستطلاع الدوري لاحقًا).
+- adapters/tsa/syriatel.adapter.ts: نفس النمط، مع action تمييزي في metadata
+  ('transfer_cash' أو 'mobile_recharge') لأن TSA تستخدم endpoint مختلف لكل
+  منهما (وحتى اسم الحقل المرتجع مختلف: billcode مقابل bill_code — الكود يتعامل
+  مع الاثنين).
+
+⚠️ تحذير أمني جوهري (لماذا "خذ وقتك" كان صحيحًا هنا):
+TSA API **لا توفر أي مفتاح idempotency** لنقاط النهاية transfer/
+transfer_cash/mobile_recharge. عند حدوث TsaAmbiguousOutcomeError (شبكة/5xx)،
+لا توجد طريقة من داخل الـ Adapter وحده لمعرفة هل نُفِّذ التحويل فعليًا أم لا.
+**أي كود مستقبلي (Phase 8 عند بناء الـ Store) يستدعي createOrder() يجب أن:**
+  1. يتحقق عبر find_tx/history (checkOrder/listIncoming) بمطابقة المبلغ+
+     المستلم+الوقت التقريبي قبل أي إعادة محاولة.
+  2. لا يعيد الإرسال أبدًا بشكل أعمى عند هذا الخطأ تحديدًا.
+هذا القيد قادم من TSA نفسها وليس شيئًا يمكن حله بالكامل من طرفنا.
+
+بيانات الاعتماد المطلوبة (تُخزَّن عبر SecretsService.setCredential، مشفّرة):
+  provider "shamcash": tsa_api_key، account_address
+  provider "syriatel": tsa_api_key، gsm
+كلا الـ provider ما زالا DISABLED في seed.ts — يجب تفعيلهما يدويًا (لاحقًا عبر
+Admin، Phase 9) بعد تخزين قيم حقيقية.
+
+اختبارات: test/unit/providers/tsa-adapters.spec.ts — تغطي TsaHttpClient (نجاح،
+رفض نظيف 401، غموض 502 لعملية مالية مقابل عدم غموضه لعملية قراءة، فشل شبكة)،
+وكلا الـ Adapter (تحويل الأرصدة، بناء الطلب، تمييز transfer_cash/
+mobile_recharge، رفض معاملات ناقصة قبل أي اتصال شبكة).
+
+────────────────────────────────────────
+6. Custody & Deposit Addresses (Phase 6, الجزء الأول) — HD Wallet محلي
+────────────────────────────────────────
+بناءً على قرارك: لا تعتمد VAYRO على أي API خارجي لتوليد العناوين. بدلًا من ذلك،
+يوجد الآن نظام اشتقاق محافظ هرمية (HD Wallet) محلي بالكامل، من جذر واحد
+(BIP39 mnemonic)، بمسارات اشتقاق قياسية موثّقة لكل شبكة:
+  BEP-20 (USDT على BNB Smart Chain): m/44'/60'/0'/0/{index}
+  TRC-20 (USDT على Tron):            m/44'/195'/0'/0/{index}
+  Litecoin (SegWit أصلي):            m/84'/2'/0'/0/{index}
+
+المكوّنات:
+- src/modules/custody/address-derivation.ts: دوال خالصة (pure) بلا أي I/O —
+  تحويل مفتاح خاص خام إلى عنوان لكل شبكة. قابلة للاختبار بمعزل عن أي قاعدة
+  بيانات أو سرّ حقيقي.
+- src/modules/custody/custody-key.service.ts: CustodyKeyService — المكان
+  الوحيد في كامل المشروع الذي يلمس مفتاحًا خاصًا. يفك تشفير الـ mnemonic
+  (مخزّن مشفّرًا AES-256-GCM عبر EncryptionService نفسها المستخدمة في كل
+  مكان آخر) ويشتق المفاتيح/العناوين عند الطلب فقط — لا تُخزَّن أي مفاتيح خاصة
+  أبدًا، لا بقاعدة البيانات ولا بأي ملف.
+- src/modules/deposit-addresses/: DepositAddressesService — عنوان واحد لكل
+  (مستخدم، شبكة) مدى الحياة، بمطالبة ذرّية بالـ index التالي عبر قفل صف على
+  جدول networks (SELECT...FOR UPDATE) لمنع تعارض عند طلبين متزامنين.
+  GET /api/v1/deposit-addresses يُرجع (وينشئ عند الحاجة) عنوانًا لكل شبكة
+  فعّالة للمستخدم الحالي.
+- src/scripts/generate-master-seed.ts: سكربت إعداد لمرة واحدة — يولّد
+  mnemonic جديد من 24 كلمة، يطبعه على الشاشة مرة واحدة فقط (اكتبه على ورق
+  واحفظه بمكان آمن فعليًا/offline)، ويخزّن فقط نسخته المشفّرة.
+- src/scripts/verify-master-seed.ts: يتحقق من صحة كود الاشتقاق مقابل متجه
+  اختبار BIP39 عام معروف (mnemonic عام، لا صلة له بأموال حقيقية)، ثم يطبع
+  عناوينك الحقيقية (index 0 و1 لكل شبكة) لتقارنها يدويًا بأداة مستقلة offline.
+
+⚠️ نموذج الأمان — اقرأ هذا قبل أي استخدام حقيقي:
+- من يملك صف wallet_master_seeds + متغيّر البيئة ENCRYPTION_KEY معًا = يمكنه
+  اشتقاق كل مفتاح خاص لكل مستخدم على كل شبكة. هذا هو المحيط الأمني بالكامل.
+  عامل ENCRYPTION_KEY بنفس عناية رمز خزنة بنك.
+- هذا تصميم Hot Wallet (المفاتيح قابلة للاشتقاق من السيرفر نفسه أثناء عمله) —
+  مناسب لاستقبال الإيداعات، لكنه **غير مُحصَّن** للاحتفاظ بأرصدة كبيرة طويلة
+  الأمد. قبل أي مبالغ حقيقية على mainnet: فكّر بـ KMS/HSM حقيقي، sweep دوري
+  لعنوان بارد (cold wallet)، ونسخ احتياطي offline متعدد.
+- **لم يُنفَّذ فعليًا/يُختبَر بأي شكل** (لا إنترنت هنا لتثبيت الحزم الجديدة:
+  @scure/bip32, @scure/bip39, @noble/curves, @noble/hashes, bs58check,
+  bech32). كود الاشتقاق مبني على مواصفات علنية موثّقة (BIP32/39/44/84,
+  EIP-55, ترميز عنوان Tron) وليس تخمينًا، لكن **يجب** تشغيل
+  verify-master-seed.ts وقراءة مخرجاته كاملة، بالإضافة لمقارنة عنوان BEP20
+  وTRC20 على الأقل بأداة offline مستقلة (بـ mnemonic اختبار فقط، أبدًا
+  الحقيقي) — قبل إرسال أي مبلغ حقيقي.
+- فقدان صف wallet_master_seeds المشفّر + النسخة الورقية معًا = ضياع دائم لكل
+  الأموال المرتبطة بكل العناوين المشتقة. لا يوجد "نسيت كلمة السر" لهذا.
+
+الخطوة التالية (لم تُبنَ بعد بقصد — ليست جزءًا من هذا التسليم):
+نظام استطلاع (poller) يقرأ Tatum API v4 (Wallet/Transactions، للقراءة فقط —
+لا يوجد Webhook في توثيق Tatum المُعطى) بشكل دوري لكل عنوان مُشتَق، يفلتر على
+عقد USDT الصحيح لكل شبكة، ويطابق كل معاملة واردة جديدة مع deposit_addresses
+لتحديد صاحبها، ثم يُقيّد المستخدم عبر WalletService (بنفس نمط idempotency
+المستخدم في كل مكان آخر — لا اعتماد مضاعف لنفس المعاملة). هذا الجزء متروك
+عمدًا لخطوة لاحقة منفصلة نظرًا لحساسيته (نفس درجة الحذر المطلوبة هنا بالضبط).
+
+────────────────────────────────────────
+7. Tatum — Deposit Monitoring (Phase 6, part 2) — مبني الآن، mainnet
+────────────────────────────────────────
+بعد بحث فعلي في توثيق Tatum الرسمي (docs.tatum.io، جُلب مباشرة، وليس تخمينًا) +
+اختبار حقيقي من طرفك بمفتاح API حقيقي، تأكّد:
+
+- Base URL: https://api.tatum.io/v4  — Auth: header x-api-key.
+- أسماء السلاسل (chain) على حسابك تحديدًا (اختبرتها فعليًا):
+    BSC:      "bsc-mainnet"
+    TRON:     "tron-mainnet"       ← أعطى 200 OK فعليًا
+    Litecoin: "litecoin-core-mainnet"  ← وليس "litecoin-mainnet" كما ظُنّ أول مرة
+  هذه القيم مخزّنة في عمود networks.tatum_chain_id (بيانات، وليست مُبرمَجة
+  داخل TypeScript) — أي تغيير مستقبلي من Tatum هو تعديل صف واحد، لا كود.
+- Tatum عنده Webhooks حقيقية (وليس استطلاعًا فقط كما ظننت في أول بحث سطحي):
+    POST /v4/subscription  {"type": "INCOMING_FUNGIBLE_TX"|"INCOMING_NATIVE_TX",
+      "attr": {"chain", "address", "url", "conditions"?}}
+  INCOMING_FUNGIBLE_TX + شرط contractAddress==عقد USDT لـ BEP20/TRC20.
+  INCOMING_NATIVE_TX لـ Litecoin (عملة أصلية، لا عقد).
+- توقيع الـ Webhook (موثّق رسميًا، طبّق حرفيًا): HMAC-SHA512 على
+  JSON.stringify(parsedBody) — وليس البايتات الخام كما هي — Base64، يُقارَن
+  بترويسة x-payload-hash. السر يُفعَّل حسابيًا (وليس لكل اشتراك) عبر
+  PUT /v4/subscription {"hmacSecret": "..."}.
+- Webhooks لـ EVM قد تصل أولًا وهي في الـ mempool (mempool:true) قبل التأكيد —
+  نتجاهلها تمامًا وننتظر الإشعار المؤكَّد.
+
+المكوّنات المبنية:
+- adapters/tatum/tatum.adapter.ts: إنشاء/حذف اشتراك، enableHmac، التحقق من
+  التوقيع (HMAC-SHA512 دقيق حسب التوثيق)، وقراءة ارتفاع البلوك الحالي.
+  **لا يُطبّق WebhookCapableProvider العام عمدًا** — التحقق من التوقيع صلاحية
+  الـ Adapter وحده، لكن تطبيق أثر الإيداع يحتاج WalletService/
+  TransactionsService التي لا تعرفهما وحدة Providers عمدًا — هذا التركيب في
+  DepositMonitoringService، بنفس حدود TransfersService.
+- modules/deposit-monitoring/: DepositMonitoringService (اشتراك تلقائي عند
+  إنشاء عنوان جديد عبر حدث 'deposit-address.created' — بلا استيراد مباشر بين
+  الوحدتين، فحص Webhook، إنشاء DepositEvent بحالة PENDING_CONFIRMATION فقط)
+  + DepositWebhookController (POST /webhooks/tatum، عام بالضرورة، الحماية
+  الوحيدة توقيع HMAC) + Cron كل دقيقة (checkPendingConfirmations) يُقيّد فقط
+  بعد بلوغ عدد التأكيدات المطلوب لكل شبكة (Network.requiredConfirmations).
+- جدول deposit_events جديد: (network_id, tx_hash) UNIQUE — الضمان الحقيقي ضد
+  ازدواج الاعتماد، منفصل عن idempotency الخاص بالـ webhook نفسه
+  (webhook_events) — طبقتا حماية مختلفتان، وليس طبقة واحدة.
+- src/scripts/setup-tatum-provider.ts: سكربت إعداد لمرة واحدة (يخزّن
+  api_key/hmac_secret، يسجّل الـ HMAC عند Tatum، يفعّل الـ provider).
+
+⚠️ ما لم يُتحقّق منه فعليًا (اقرأ قبل الثقة الكاملة، mainnet):
+- شكل استجابة GET /v4/data/blockchains/block/current بالضبط (اسم الحقل: result
+  أم blockNumber أم height) — الكود يحاول عدة احتمالات شائعة ويرمي خطأ واضحًا
+  إن فشل التحليل، لكن يجب التحقق بطلب حقيقي واحد قبل الاعتماد على عدّاد
+  التأكيدات (checkPendingConfirmations).
+- عناوين عقود USDT في seed.ts (BEP20: 0x55d398...، TRC20: TR7NHqjeK...) هي
+  القيم المنشورة علنًا والمعروفة، لكن تحقّق منها بنفسك من مصدر مستقل قبل
+  الاعتماد الكامل — عنوان خاطئ يعني عدم اكتشاف الإيداعات بصمت.
+- لا توجد أداة "backfill" حاليًا لإيداع فات نافذة الاشتراك (مثلًا Webhook فشل
+  توصيله من Tatum) — إن احتجت هذا لاحقًا، أخبرني.
+- الرسوم (fee) على المزوّد نفسه: خطط Tatum المجانية تراقب حتى 10 عناوين فقط —
+  تحقق من خطتك قبل تفعيل هذا لعدد كبير من المستخدمين.
+
+طريقة التشغيل والتحقق:
+```
+cd apps/api
+npm install
+npx prisma generate
+npx prisma migrate dev --name add_tatum_deposit_monitoring
+npm run prisma:seed
+npm run test -- deposit-monitoring tatum-adapter
+
+# .env: أضف PUBLIC_API_BASE_URL (رابط حقيقي متاح من الإنترنت — استخدم ngrok/
+# cloudflared محليًا، Tatum لا يصل لـ localhost)
+
+TATUM_API_KEY=xxx TATUM_HMAC_SECRET=$(openssl rand -hex 32) npm run tatum:setup
+npm run start:dev
+# ثم من مستخدم حقيقي: GET /api/v1/deposit-addresses (ينشئ الاشتراكات تلقائيًا)
+# راقب اللوجات لأول Webhook حقيقي، وتحقق من deposit_events يدويًا قبل أي اعتماد فعلي على مبلغ كبير.
+```
+
+────────────────────────────────────────
+8. Withdrawals (Phase 7) — أول استخدام فعلي لـ Sham Cash/Syriatel Adapters
+────────────────────────────────────────
+POST /api/v1/withdrawals — أول مسار يستخدم فعليًا ShamCashAdapter/
+SyriatelAdapter.createOrder() (كانا مسجّلين بالـ Registry منذ Phase 5 لكن بلا
+مستهلك حقيقي حتى الآن).
+
+اكتشاف مهم أثناء البناء: WalletService كان يملك فعليًا hold()/release()/
+settle() منذ Phase 3 — جاهزة تمامًا لهذا الاستخدام بالضبط، ولم تُستخدَم من قبل.
+هذا بالضبط النمط الصحيح لعملية سحب حقيقية:
+
+  1. hold() — الرصيد يُحجَز (available → held) **قبل** أي اتصال بالمزوّد
+     الخارجي، وداخل نفس الـ transaction اللي أنشأت سجل Transaction.
+  2. استدعاء المزوّد **خارج** أي DB transaction (لا نُبقي transaction مفتوحة
+     أثناء انتظار الشبكة).
+  3. حسب النتيجة:
+       نجاح مؤكَّد   → settle() — الحجز يتحول لخصم دائم + قيد Ledger DEBIT فعلي.
+       رفض مؤكَّد    → release() — الرصيد يرجع متاحًا بالكامل، كأن شيئًا لم يحدث.
+       نتيجة غامضة  → **لا شيء** — الرصيد يبقى held كما هو، الحالة تبقى
+                        PROCESSING. هذا هو بالضبط سبب بناء TsaAmbiguousOutcomeError
+                        سابقًا — الآن له استهلاك حقيقي.
+
+WithdrawalsService.resolveAmbiguousWithdrawal(txPublicId, 'SUCCEEDED'|'FAILED')
+موجودة لحسم الحالة الغامضة يدويًا بعد التحقق من طرف المزوّد فعليًا (عبر find_tx/
+history) — لا واجهة Admin لها بعد (Phase 9)، تُستدعى حاليًا فقط عبر سكربت/كود.
+
+ثغرة معروفة ومقصودة: الـ DTO لا يتحقق من شكل `destination` بحسب كل مزوّد على
+حدة (يقبل أي كائن) — التحقق الفعلي يحصل داخل كل Adapter (toAddress/toGsm/
+pinCode المطلوبة). تحقق أدق (discriminated union DTO) يمكن إضافته لاحقًا.
+
+اختبارات: test/unit/withdrawals/withdrawals.service.spec.ts — تغطي: رفض سحب
+يتجاوز الرصيد قبل أي اتصال بالمزوّد، نجاح كامل (settle + قيد Ledger)، رفض
+مؤكَّد (release كامل)، **نتيجة غامضة (الرصيد يبقى held بالضبط، لا يُطلَق ولا
+يُسوَّى)**، idempotency (لا استدعاء مزدوج للمزوّد بنفس المفتاح)، وحسم الحالة
+الغامضة يدويًا (كلا الاتجاهين).
+
+────────────────────────────────────────
+9. المتجر (Store) — Phase 8
+────────────────────────────────────────
+بنية Product → ProviderService → Provider (§10) — منتج لا يشير لمزوّد مباشرة
+أبدًا، فقط عبر ProviderService القابل للتبديل (تعطيل صف، تفعيل آخر) دون لمس
+المنتج نفسه.
+
+- GET  /api/v1/store/categories، /store/products، /store/products/:id — عامة
+  (لا تحتاج تسجيل دخول)، لا تُرجع أبدًا أي شيء عن كيفية التنفيذ (لا providerId
+  ولا providerSkuCode) — فقط السعر والتوفر.
+- POST /api/v1/store/orders — **نفس نمط hold/release/settle** المستخدم في
+  Withdrawals (§7) حرفيًا: حجز الرصيد أولًا، استدعاء المزوّد خارج أي DB
+  transaction، ثم settle عند النجاح المؤكَّد أو release عند الرفض المؤكَّد، أو
+  **لا شيء** (يبقى held، الطلب يبقى PROCESSING) عند نتيجة غامضة — بلا أي تخمين.
+- GET /api/v1/store/orders، /store/orders/:publicId — طلباتي (IDOR-safe، نفس
+  404 موحّد لغير الموجود أو غير المملوك).
+- store-order-state-machine.ts: جدول انتقالات صريح منفصل تمامًا عن
+  transaction-state-machine.ts (حالة الطلب قد تختلف عن حالة الدفع — مثلاً دفع
+  مكتمل لكن تسليم فشل لاحقًا يتطلّب استرداد).
+- المبلغ يُلتقَط (snapshot) وقت الطلب من ProviderService.priceAmount — تغيير
+  السعر لاحقًا لا يؤثر أبدًا على طلب سابق.
+- بيانات تجريبية (seed.ts): فئة+منتج+ProviderService واحد يستخدم "mock"
+  provider حصرًا — يسمح باختبار السلسلة كاملة (Product→Service→Provider→Wallet)
+  بدون أي مزوّد حقيقي لشحن ألعاب/اشتراكات (لا يوجد توثيق لأي منهم بعد).
+
+اختبارات: test/unit/store/store-orders.service.spec.ts — نفس تغطية Withdrawals
+(رفض تجاوز رصيد قبل اتصال شبكة، نجاح مع تسوية، رفض مؤكَّد مع استرجاع كامل،
+**نتيجة غامضة تُبقي الرصيد held بالضبط**، idempotency، ضرب السعر بالكمية،
+منتج بلا ProviderService فعّال يُرفض قبل أي اتصال).
+
+ثغرات معروفة، مؤجَّلة عمدًا لـ Phase 9 (Admin Dashboard):
+- لا CRUD حقيقي للفئات/المنتجات/ProviderService — فقط seed.ts يدوي حاليًا.
+- لا واجهة لحسم AMBIGUOUS_OUTCOME (نفس القيد الموجود بـ Withdrawals).
+- لا نظام Refund فعلي بعد (الحالة REFUNDED موجودة بمخطط قاعدة البيانات فقط).

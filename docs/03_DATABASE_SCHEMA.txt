@@ -1,0 +1,106 @@
+VAYRO — 03_DATABASE_SCHEMA.txt
+================================
+MySQL 8+ / InnoDB. المصدر الحقيقي: apps/api/prisma/schema.prisma
+(الترحيل الفعلي: apps/api/prisma/migrations/20260906000000_init/migration.sql)
+
+────────────────────────────────────────
+0. قرار الـ ORM
+────────────────────────────────────────
+تم اختيار **Prisma** (وليس TypeORM) للأسباب التالية:
+- Migrations نصية صريحة (SQL) سهلة المراجعة قبل التطبيق — مهم لمشروع مالي.
+- Type-safety كامل على مستوى الاستعلامات دون كتابة يدوية لكل Repository.
+- `$transaction` صريح وواضح لعمليات الـ Ledger متعددة الخطوات.
+- الحسابات المالية الحساسة (Ledger entries, balance updates) تُنفَّذ عبر
+  `$transaction` صريح وبيانات bigint يدوية — وليس عبر أي "auto-magic" من الـ ORM،
+  تمامًا لتفادي أي تقريب أو سلوك ضمني.
+القرار نهائي لهذه المرحلة ولن يُترك كخيارين مفتوحين.
+
+────────────────────────────────────────
+1. Public IDs
+────────────────────────────────────────
+كل جدول رئيسي له `id` (BIGINT UNSIGNED AUTO_INCREMENT، داخلي فقط) و`public_id`
+(CHAR(36) UUID) يُستخدم في كل استجابة API. لا يُكشف أي `id` داخلي للعميل أبدًا
+(انظر jwt.strategy.ts: التوكن لا يحمل سوى public_id).
+
+────────────────────────────────────────
+2. Identity & Access
+────────────────────────────────────────
+users
+  - username / username_lower: الأول للعرض، الثاني (lowercase) UNIQUE ويُستخدم في
+    كل بحث/تسجيل دخول — يضمن عدم تكرار الاسم بأحرف مختلفة الحالة.
+  - status: PENDING → ACTIVE → FROZEN/BANNED. الحسابات غير ACTIVE ممنوعة من
+    تسجيل الدخول أو العمليات الحساسة (auth.service.ts).
+  - failed_login_count / locked_until: قفل تلقائي بعد محاولات فاشلة متكررة.
+  - password_hash: Argon2id فقط.
+
+user_profiles: بيانات عرض غير حساسة (١-١ مع users).
+
+roles / permissions / role_permissions / user_roles: RBAC قياسي many-to-many.
+
+sessions: الجلسات المبنية على refresh token.
+  - refresh_token_hash: SHA-256 للتوكن الخام، لا نص صريح أبدًا.
+  - replaced_by_session_id: يبني سلسلة Rotation — يُستخدم لاكتشاف الـ Replay.
+  - revoked_at: تعطيل فوري (logout، إعادة تعيين كلمة مرور، اكتشاف replay).
+
+password_reset_tokens: token_hash UNIQUE، used_at لمنع إعادة الاستخدام، expires_at قصير.
+
+two_factor_secrets: encrypted_secret فقط (عبر EncryptionService) — بنية جاهزة،
+غير مفعّلة بعد في تدفق حقيقي.
+
+reserved_usernames: قائمة قابلة للتعديل من لوحة الإدارة لاحقًا (البذرة الافتراضية
+في seed.ts: admin, vayro, root...).
+
+username_change_history: سجل كل تغيير (old/new/changed_by/reason) — يُستخدم أيضًا
+لحساب فترة التهدئة (cooldown) 30 يومًا في UsersService.changeUsername.
+
+────────────────────────────────────────
+3. Wallet & Ledger (جداول موجودة من Phase 1 — لا منطق أعمال مربوط بعد)
+────────────────────────────────────────
+assets: ديناميكي بالكامل (code, decimals لكل عملة/خدمة) — لا hardcoding بالواجهة.
+
+wallets / wallet_accounts:
+  - available_minor / held_minor: BIGINT — إضافة Phase 2 حسب تعليمات الـ Holds.
+    balance_cached القديم استُبدل بهذا التقسيم الصريح؛ العرض للمستخدم =
+    available_minor (وليس مصدر الحقيقة النهائي — ذلك هو ledger_entries).
+
+ledger_accounts / ledger_entries: Double-Entry حقيقي.
+  - owner_type: USER | SYSTEM | PROVIDER | FEE_POOL.
+  - balance_minor (BigInt، أُضيف في Phase 3): الرصيد الجاري الموثوق لكل ledger_account،
+    يُحدَّث حصرًا داخل LedgerService.postEntry تحت قفل صف (SELECT...FOR UPDATE) —
+    هذا ما يمنع أي Race Condition عند تزامن عمليتين على نفس الحساب.
+  - كل ledger_entry له direction (DEBIT/CREDIT) + balance_after، ويرتبط بـ
+    transaction_id واحد — يسمح بإعادة بناء أي رصيد تاريخيًا من الصفر عند الحاجة.
+
+transactions: idempotency_key UNIQUE على مستوى DB (وليس فقط تحقق بالكود) —
+هذا ما يمنع التنفيذ المزدوج فعليًا تحت أي Race Condition.
+  - status: PENDING → PROCESSING → COMPLETED/FAILED/CANCELLED → (REFUNDING → REFUNDED).
+    الانتقالات ستُفرض حصريًا من داخل TransactionsService عند بنائها في Phase 4/5
+    (لا توجد بعد آلية إنفاذ فعلية لأن لا معاملات فعلية تُنشأ في Phase 2).
+
+transaction_events: سجل تفصيلي لكل تغيير حالة/رد مزود.
+
+────────────────────────────────────────
+4. Providers
+────────────────────────────────────────
+providers.status: ACTIVE | DISABLED | ARCHIVED (enum) — لا حذف فعلي (hard delete)
+من الكود لأي Provider؛ الحذف الحقيقي محظور على مستوى القيد أيضًا:
+provider_credentials.provider_id FK هو ON DELETE RESTRICT، أي أن أي محاولة حذف
+Provider له بيانات اعتماد مخزَّنة سترفضها قاعدة البيانات نفسها.
+
+provider_credentials.encrypted_value: TEXT، ciphertext فقط (AES-256-GCM).
+
+────────────────────────────────────────
+5. Audit
+────────────────────────────────────────
+audit_logs: actor_id (nullable = فعل نظامي)، before/after كـ JSON، reason.
+غير مربوط بعد بأي إجراء إداري فعلي (لا لوحة إدارة في Phase 2) — الجدول جاهز فقط.
+
+────────────────────────────────────────
+6. Indexes / Constraints الحرجة
+────────────────────────────────────────
+- users: UNIQUE(username), UNIQUE(username_lower), UNIQUE(email), UNIQUE(phone).
+- transactions: UNIQUE(idempotency_key), UNIQUE(public_id).
+- provider_credentials: UNIQUE(provider_id, key_name).
+- ledger_accounts: UNIQUE(owner_type, owner_id, asset_id).
+- wallet_accounts: UNIQUE(wallet_id, asset_id).
+- كل علاقة رئيسية مربوطة بـ FOREIGN KEY صريح (لا علاقات ضمنية).

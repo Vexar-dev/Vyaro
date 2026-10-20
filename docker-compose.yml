@@ -1,0 +1,135 @@
+name: vayro
+# التشغيل (من جذر المشروع، هذا الملف هو الأساسي):
+#   docker compose up -d --build
+# أول مرة: خدمة init تنشئ الجداول والـ triggers والبيانات الأساسية والمدير الأول ثم تنتهي.
+
+x-api-env: &api-env
+  env_file:
+    - .env
+  environment:
+    NODE_ENV: production
+    # داخل الشبكة الداخلية: أسماء الخدمات بدل localhost (تتغلّب على .env)
+    DATABASE_URL: mysql://${MYSQL_USER:-vayro_app}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-vayro}
+    REDIS_URL: redis://redis:6379
+    UPLOAD_DIR: /data/uploads
+    TRUST_PROXY: "1"
+    COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-vayro}
+      MYSQL_USER: ${MYSQL_USER:-vayro_app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    command: ["--default-authentication-plugin=mysql_native_password", "--log-bin-trust-function-creators=1"]
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # مهمة تهيئة تعمل مرة عند كل up وتنتهي (كل خطواتها آمنة للتكرار)
+  init:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: build
+    <<: *api-env
+    working_dir: /app/apps/api
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        # db push ينشئ الجداول من schema.prisma على قاعدة جديدة. (لا يستخدم --accept-data-loss: يفشل بدل أن يحذف بيانات)
+        npx prisma db push --skip-generate
+        npm run db:triggers
+        npx prisma db seed
+        if [ -n "$$ADMIN_EMAIL" ]; then npm run create-admin; else echo "ADMIN_EMAIL غير مضبوط — تخطّي إنشاء المدير"; fi
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    <<: *api-env
+    command: ["node", "apps/api/dist/src/main.js"]
+    volumes:
+      - uploads_data:/data/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/api/v1/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    <<: *api-env
+    command: ["node", "apps/api/dist/src/worker.js"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: /api/v1
+        SKIP_TYPECHECK: ${SKIP_TYPECHECK:-true}
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "443:443"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - api
+      - web
+
+volumes:
+  mysql_data:
+  redis_data:
+  uploads_data:
+  caddy_data:

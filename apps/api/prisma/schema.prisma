@@ -1,0 +1,806 @@
+// VAYRO — Prisma Schema
+// ORM DECISION: Prisma (chosen over TypeORM — see docs/03_DATABASE_SCHEMA.txt §0 for rationale).
+// All monetary columns use BigInt minor-units or fixed-precision Decimal — never Float/Double.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// IDENTITY & ACCESS
+// ─────────────────────────────────────────────────────────────
+
+enum UserStatus {
+  PENDING
+  ACTIVE
+  FROZEN
+  BANNED
+}
+
+model User {
+  id               BigInt    @id @default(autoincrement())
+  publicId         String    @unique @default(uuid()) @map("public_id")
+  username         String    @unique @db.VarChar(32)
+  usernameLower    String    @unique @map("username_lower") @db.VarChar(32) // enforced-lowercase mirror for case-insensitive search
+  email            String    @unique
+  // E.164 (+9639XXXXXXXX). MANDATORY and IMMUTABLE: set once at registration; a DB trigger
+  // (migration 20261015000000) rejects any UPDATE that changes it. Withdrawals are always sent here.
+  phone            String    @unique @db.VarChar(20)
+  // Sham Cash ACCOUNT ADDRESS the user's withdrawals are sent to. Mandatory + immutable, exactly like phone
+  // (same DB trigger, prisma/sql/payout-identifiers-trigger.sql). Entered once at registration.
+  shamcashAddress  String    @unique @map("shamcash_address") @db.VarChar(128)
+  passwordHash     String    @map("password_hash")
+  status           UserStatus @default(PENDING)
+  emailVerifiedAt  DateTime? @map("email_verified_at")
+  phoneVerifiedAt  DateTime? @map("phone_verified_at")
+  twoFactorEnabled Boolean   @default(false) @map("two_factor_enabled")
+  failedLoginCount Int       @default(0) @map("failed_login_count")
+  lockedUntil      DateTime? @map("locked_until")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  profile              UserProfile?
+  roles                UserRole[]
+  sessions             Session[]
+  twoFactorSecret      TwoFactorSecret?
+  passwordResetTokens  PasswordResetToken[]
+  usernameChangesFrom  UsernameChangeHistory[] @relation("UsernameChangeUser")
+  auditLogsActedBy     AuditLog[]              @relation("AuditActor")
+  depositAddresses     DepositAddress[]
+  storeOrders          StoreOrder[]
+  kycSubmissions       KycSubmission[]
+
+  @@index([status])
+  @@map("users")
+}
+
+model UserProfile {
+  id        BigInt   @id @default(autoincrement())
+  userId    BigInt   @unique @map("user_id")
+  fullName  String?  @map("full_name")
+  avatarUrl String?  @map("avatar_url")
+  locale    String   @default("ar")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_profiles")
+}
+
+enum RoleCode {
+  USER
+  SUPPORT
+  ADMIN
+  SUPER_ADMIN
+  STORE_ADMIN // store-only back office (catalog, pricing, suppliers) — no user/wallet powers
+}
+
+model Role {
+  id          BigInt   @id @default(autoincrement())
+  code        RoleCode @unique
+  name        String
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  permissions RolePermission[]
+  users       UserRole[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id    BigInt @id @default(autoincrement())
+  code  String @unique // e.g. "users.freeze", "providers.manage"
+  label String
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       BigInt @map("role_id")
+  permissionId BigInt @map("permission_id")
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId BigInt @map("user_id")
+  roleId BigInt @map("role_id")
+  assignedAt DateTime @default(now()) @map("assigned_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+// Refresh-token backed sessions. Access tokens (JWT) are stateless and NOT stored.
+model Session {
+  id                BigInt    @id @default(autoincrement())
+  publicId          String    @unique @default(uuid()) @map("public_id")
+  userId            BigInt    @map("user_id")
+  refreshTokenHash  String    @map("refresh_token_hash") // sha256 hash, never plaintext
+  deviceName        String?   @map("device_name")
+  userAgent         String?   @map("user_agent") @db.VarChar(512)
+  ipAddress         String?   @map("ip_address") @db.VarChar(64)
+  createdAt         DateTime  @default(now()) @map("created_at")
+  lastUsedAt         DateTime  @default(now()) @map("last_used_at")
+  expiresAt         DateTime  @map("expires_at")
+  revokedAt         DateTime? @map("revoked_at")
+  replacedBySessionId BigInt? @map("replaced_by_session_id") // rotation chain, for replay detection
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model PasswordResetToken {
+  id        BigInt    @id @default(autoincrement())
+  userId    BigInt    @map("user_id")
+  tokenHash String    @unique @map("token_hash") // sha256 hash of the one-time token
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("password_reset_tokens")
+}
+
+model TwoFactorSecret {
+  userId           BigInt   @id @map("user_id")
+  encryptedSecret  String   @map("encrypted_secret") // encrypted via EncryptionService, never plaintext
+  confirmedAt      DateTime? @map("confirmed_at")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("two_factor_secrets")
+}
+
+model ReservedUsername {
+  id        BigInt   @id @default(autoincrement())
+  username  String   @unique @db.VarChar(32) // stored lowercase
+  reason    String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("reserved_usernames")
+}
+
+model UsernameChangeHistory {
+  id          BigInt   @id @default(autoincrement())
+  userId      BigInt   @map("user_id")
+  oldUsername String   @map("old_username") @db.VarChar(32)
+  newUsername String   @map("new_username") @db.VarChar(32)
+  changedBy   BigInt?  @map("changed_by") // null = self-service, else admin user id
+  reason      String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  user User @relation("UsernameChangeUser", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("username_change_history")
+}
+
+// ─────────────────────────────────────────────────────────────
+// WALLET & LEDGER  (schema carried forward from Phase 1, holds added)
+// ─────────────────────────────────────────────────────────────
+
+model Asset {
+  id        BigInt   @id @default(autoincrement())
+  code      String   @unique @db.VarChar(16) // USDT, VYR_SCS, VYR_SCD, SYRIATEL_CASH...
+  name      String
+  type      String   // crypto | fiat_wallet | mobile_cash
+  decimals  Int      @default(2) // minor-unit precision for this asset
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  ledgerAccounts LedgerAccount[]
+  wallets        WalletAccount[]
+
+  @@map("assets")
+}
+
+model Wallet {
+  id       BigInt @id @default(autoincrement())
+  userId   BigInt @unique @map("user_id")
+  status   String @default("ACTIVE")
+
+  accounts WalletAccount[]
+
+  @@map("wallets")
+}
+
+// available_minor/held_minor are the ONLY fields WalletService writes, and only via
+// hold()/release()/settle()/credit()/debit() under a row lock — never written to
+// directly by any other module. credit/debit/settle also post a matching
+// LedgerService entry in the same DB transaction, so this projection and the
+// ledger's balance_minor can never drift apart.
+model WalletAccount {
+  id             BigInt   @id @default(autoincrement())
+  walletId       BigInt   @map("wallet_id")
+  assetId        BigInt   @map("asset_id")
+  availableMinor BigInt   @default(0) @map("available_minor") // BigInt minor units
+  heldMinor      BigInt   @default(0) @map("held_minor")       // funds reserved by pending orders
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  wallet Wallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  asset  Asset  @relation(fields: [assetId], references: [id])
+
+  @@unique([walletId, assetId])
+  @@map("wallet_accounts")
+}
+
+enum LedgerOwnerType {
+  USER
+  SYSTEM
+  PROVIDER
+  FEE_POOL
+}
+
+model LedgerAccount {
+  id        BigInt          @id @default(autoincrement())
+  ownerType LedgerOwnerType @map("owner_type")
+  ownerId   BigInt?         @map("owner_id") // null for SYSTEM-wide accounts
+  assetId   BigInt          @map("asset_id")
+  // Authoritative running balance for THIS ledger account, in the asset's minor units.
+  // Updated only inside LedgerService.postEntry under a row lock (SELECT ... FOR UPDATE),
+  // in the same DB transaction as the ledger_entries insert — this is what every
+  // ledger_entries.balance_after is derived from. For USER-owned accounts,
+  // wallet_accounts.available_minor is a denormalized projection of this value kept in
+  // sync in that same transaction (see WalletService) so the API never has to sum
+  // ledger_entries to answer "what's my balance".
+  balanceMinor BigInt @default(0) @map("balance_minor")
+
+  asset   Asset          @relation(fields: [assetId], references: [id])
+  entries LedgerEntry[]
+
+  @@unique([ownerType, ownerId, assetId])
+  @@map("ledger_accounts")
+}
+
+enum LedgerDirection {
+  DEBIT
+  CREDIT
+}
+
+model LedgerEntry {
+  id              BigInt          @id @default(autoincrement())
+  ledgerAccountId BigInt          @map("ledger_account_id")
+  transactionId   BigInt          @map("transaction_id")
+  direction       LedgerDirection
+  amountMinor     BigInt          @map("amount_minor") // always positive; sign implied by direction
+  balanceAfter    BigInt          @map("balance_after")
+  createdAt       DateTime        @default(now()) @map("created_at")
+
+  ledgerAccount LedgerAccount @relation(fields: [ledgerAccountId], references: [id])
+  transaction   Transaction   @relation(fields: [transactionId], references: [id])
+
+  @@index([ledgerAccountId])
+  @@map("ledger_entries")
+}
+
+enum TransactionType {
+  TRANSFER
+  CONVERSION
+  DEPOSIT
+  WITHDRAWAL
+  FEE
+  REFUND
+  ORDER
+}
+
+// Explicit state machine — transitions enforced only inside TransactionsService.
+enum TransactionStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+  REFUNDING
+  REFUNDED
+}
+
+model Transaction {
+  id             BigInt            @id @default(autoincrement())
+  publicId       String            @unique @default(uuid()) @map("public_id")
+  type           TransactionType
+  status         TransactionStatus @default(PENDING)
+  idempotencyKey String            @unique @map("idempotency_key")
+  referenceId    String?           @map("reference_id")
+  initiatedBy    BigInt?           @map("initiated_by")
+  createdAt      DateTime          @default(now()) @map("created_at")
+  updatedAt      DateTime          @updatedAt @map("updated_at")
+
+  entries LedgerEntry[]
+  events  TransactionEvent[]
+  depositEvent DepositEvent?
+  storeOrder StoreOrder?
+
+  @@index([status])
+  @@map("transactions")
+}
+
+model TransactionEvent {
+  id            BigInt   @id @default(autoincrement())
+  transactionId BigInt   @map("transaction_id")
+  eventType     String   @map("event_type") // e.g. "STATUS_CHANGED", "PROVIDER_RESPONSE"
+  payloadJson   Json?    @map("payload_json")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  transaction Transaction @relation(fields: [transactionId], references: [id])
+
+  @@map("transaction_events")
+}
+
+// ─────────────────────────────────────────────────────────────
+// PROVIDERS  (lifecycle: ACTIVE → DISABLED → ARCHIVED, never hard-deleted once referenced)
+// ─────────────────────────────────────────────────────────────
+
+enum ProviderStatus {
+  ACTIVE
+  DISABLED
+  ARCHIVED
+}
+
+model Provider {
+  id        BigInt         @id @default(autoincrement())
+  code      String         @unique @db.VarChar(32)
+  name      String
+  type      String         // payment | crypto | game | phone | other
+  status    ProviderStatus @default(DISABLED)
+  createdAt DateTime       @default(now()) @map("created_at")
+  updatedAt DateTime       @updatedAt @map("updated_at")
+
+  credentials   ProviderCredential[]
+  logs          ProviderLog[]
+  webhookEvents WebhookEvent[]
+  providerServices ProviderService[]
+
+  @@map("providers")
+}
+
+// Phase 5 — every ProviderAdapter call (real or Mock) is wrapped by
+// ProviderLogService.logCall(), which writes exactly one row here whether it
+// succeeded or threw. This is what "Provider Logs" in the Admin Dashboard (§12)
+// will read from — nothing else writes to this table.
+model ProviderLog {
+  id              BigInt   @id @default(autoincrement())
+  providerId      BigInt   @map("provider_id")
+  action          String   @db.VarChar(64) // e.g. CREATE_ORDER, CHECK_ORDER, CANCEL_ORDER, WEBHOOK, GET_BALANCE
+  requestPayload  Json?    @map("request_payload")
+  responsePayload Json?    @map("response_payload")
+  success         Boolean
+  errorMessage    String?  @map("error_message") @db.Text
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Restrict)
+
+  @@index([providerId, createdAt])
+  @@map("provider_logs")
+}
+
+// Phase 5 — the idempotency backbone for ALL future inbound webhooks (Phase 6/7).
+// (provider_id, event_id) is UNIQUE, so the same provider retrying the same
+// event (their timeout, our slow response, a network blip) can never be
+// processed twice — see ProviderLogService.recordWebhookEvent().
+model WebhookEvent {
+  id             BigInt    @id @default(autoincrement())
+  providerId     BigInt    @map("provider_id")
+  eventId        String    @map("event_id") @db.VarChar(191) // the PROVIDER's own event/notification id
+  payload        Json
+  signatureValid Boolean   @map("signature_valid")
+  processedAt    DateTime? @map("processed_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Restrict)
+
+  @@unique([providerId, eventId])
+  @@map("webhook_events")
+}
+
+// encrypted_value holds ciphertext only; the master key lives outside MySQL entirely
+// (env-based in dev, KMS/Secrets Manager in production — see EncryptionService).
+model ProviderCredential {
+  id             BigInt   @id @default(autoincrement())
+  providerId     BigInt   @map("provider_id")
+  keyName        String   @map("key_name")
+  encryptedValue String   @map("encrypted_value") @db.Text
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  provider Provider @relation(fields: [providerId], references: [id], onDelete: Restrict)
+
+  @@unique([providerId, keyName])
+  @@map("provider_credentials")
+}
+
+// ─────────────────────────────────────────────────────────────
+// AUDIT
+// ─────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id         BigInt   @id @default(autoincrement())
+  actorId    BigInt?  @map("actor_id") // null = system
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id")
+  ipAddress  String?  @map("ip_address") @db.VarChar(64)
+  before     Json?
+  after      Json?
+  reason     String?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  actor User? @relation("AuditActor", fields: [actorId], references: [id])
+
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}
+
+// ─────────────────────────────────────────────────────────────
+// CUSTODY / DEPOSIT ADDRESSES (Phase 6) — local HD wallet derivation.
+// See docs/05_APIS_AND_PROVIDERS.txt §6 for the full security model before
+// touching anything here.
+// ─────────────────────────────────────────────────────────────
+
+enum NetworkCode {
+  BEP20 // USDT on BNB Smart Chain
+  TRC20 // USDT on Tron
+  LTC   // Litecoin native SegWit
+}
+
+model Network {
+  id                  BigInt      @id @default(autoincrement())
+  code                NetworkCode @unique
+  name                String
+  isActive            Boolean     @default(true) @map("is_active")
+  // Next unused BIP32 derivation index for this network. Only ever read/written
+  // inside a `SELECT ... FOR UPDATE` transaction (DepositAddressesService) —
+  // never touched directly, or two concurrent requests could claim (and derive
+  // an address for) the same index.
+  nextDerivationIndex Int         @default(0) @map("next_derivation_index")
+  // Tatum's own chain identifier for this network (e.g. "bsc-mainnet",
+  // "tron-mainnet", "litecoin-core-mainnet") — confirmed by live-testing
+  // against Tatum's API, not guessed. Kept as data, not hardcoded in TS, so a
+  // future Tatum renaming is a one-row update, not a code change.
+  tatumChainId        String?     @db.VarChar(64) @map("tatum_chain_id")
+  // The USDT (or other fungible token) contract address to filter deposits by
+  // on this network. NULL for native-coin networks (e.g. LTC) — those use
+  // INCOMING_NATIVE_TX instead of INCOMING_FUNGIBLE_TX and need no contract filter.
+  tokenContractAddress String?    @db.VarChar(128) @map("token_contract_address")
+  // Confirmations required before a detected deposit is credited. Operator-
+  // adjustable per network — see docs/05_APIS_AND_PROVIDERS.txt §7.
+  requiredConfirmations Int       @default(12) @map("required_confirmations")
+  createdAt           DateTime    @default(now()) @map("created_at")
+  updatedAt           DateTime    @updatedAt @map("updated_at")
+
+  depositAddresses DepositAddress[]
+  depositEvents    DepositEvent[]
+
+  @@map("networks")
+}
+
+// One per (user, network) — created once, for life. The PRIVATE KEY for
+// this address is never stored: it's re-derived on demand from the master
+// seed + derivationIndex whenever needed (see CustodyKeyService).
+model DepositAddress {
+  id              BigInt   @id @default(autoincrement())
+  userId          BigInt   @map("user_id")
+  networkId       BigInt   @map("network_id")
+  derivationIndex Int      @map("derivation_index")
+  address         String   @unique @db.VarChar(128)
+  // Tatum subscription id for this address's deposit webhook, once created —
+  // lets us DELETE /v4/subscription/{id} if the address is ever deactivated.
+  tatumSubscriptionId String? @db.VarChar(64) @map("tatum_subscription_id")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Restrict)
+  network Network @relation(fields: [networkId], references: [id], onDelete: Restrict)
+  depositEvents DepositEvent[]
+
+  @@unique([userId, networkId])
+  @@unique([networkId, derivationIndex])
+  @@map("deposit_addresses")
+}
+
+enum DepositStatus {
+  PENDING_CONFIRMATION
+  CREDITED
+  FAILED
+}
+
+// Phase 6, part 2 — one row per on-chain deposit detected via a Tatum
+// webhook. (network_id, tx_hash) is UNIQUE: the actual, DB-enforced guard
+// against ever crediting the same on-chain transaction twice, independent of
+// the separate webhook_events dedup (which only guards against reprocessing
+// the same WEBHOOK DELIVERY — a different thing).
+model DepositEvent {
+  id               BigInt        @id @default(autoincrement())
+  depositAddressId BigInt        @map("deposit_address_id")
+  networkId        BigInt        @map("network_id")
+  txHash           String        @db.VarChar(128) @map("tx_hash")
+  // Decimal string, in OUR ledger asset's units (already human-readable — see
+  // docs/05_APIS_AND_PROVIDERS.txt §7 on why we trust Tatum's reported amount
+  // rather than re-deriving it from raw token units ourselves).
+  amount           String        @db.VarChar(64)
+  blockNumber      BigInt?       @map("block_number")
+  status           DepositStatus @default(PENDING_CONFIRMATION)
+  transactionId    BigInt?       @unique @map("transaction_id")
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+
+  depositAddress DepositAddress @relation(fields: [depositAddressId], references: [id], onDelete: Restrict)
+  network        Network        @relation(fields: [networkId], references: [id], onDelete: Restrict)
+  transaction    Transaction?   @relation(fields: [transactionId], references: [id])
+
+  @@unique([networkId, txHash])
+  @@index([status])
+  @@map("deposit_events")
+}
+
+// Exactly one row expected (label="primary"), created ONCE by
+// scripts/generate-master-seed.ts and never overwritten. encryptedMnemonic is
+// AES-256-GCM ciphertext via EncryptionService — the SAME algorithm/format as
+// provider_credentials.encrypted_value, never the plaintext mnemonic.
+model WalletMasterSeed {
+  id                BigInt   @id @default(autoincrement())
+  label             String   @unique @db.VarChar(64)
+  encryptedMnemonic String   @db.Text @map("encrypted_mnemonic")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  @@map("wallet_master_seeds")
+}
+
+// ─────────────────────────────────────────────────────────────
+// STORE (Phase 8) — Product → ProviderService → Provider.
+// "لا تجعل المتجر مرتبطًا بمزود واحد" (§10): a Product never references a
+// Provider directly — only through ProviderService, which can be swapped
+// (deactivate one row, activate another) without ever touching the Product.
+// ─────────────────────────────────────────────────────────────
+
+model ProductCategory {
+  id        BigInt   @id @default(autoincrement())
+  // Nesting: "ألعاب موبايل" (parent) → "ببجي" (child). Null = top level.
+  parentId  BigInt?  @map("parent_id")
+  name      String
+  slug      String   @unique @db.VarChar(64)
+  imageUrl  String?  @map("image_url") @db.VarChar(512) // category logo shown to users
+  description String? @db.Text
+  isActive  Boolean  @default(true) @map("is_active")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  parent   ProductCategory?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children ProductCategory[] @relation("CategoryTree")
+  products Product[]
+
+  @@index([parentId])
+  @@map("product_categories")
+}
+
+model Product {
+  id          BigInt   @id @default(autoincrement())
+  categoryId  BigInt   @map("category_id")
+  name        String
+  description String?  @db.Text
+  imageUrl    String?  @map("image_url") @db.VarChar(512)
+  gallery     Json?    // extra image URLs (string[]) shown when the product is opened
+  fields      Json?    // fields the BUYER must fill at purchase: [{ key, label }] e.g. Player_ID
+  isActive    Boolean  @default(true) @map("is_active")
+  sortOrder   Int      @default(0) @map("sort_order")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  category ProductCategory   @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  services ProviderService[]
+  orders   StoreOrder[]
+
+  @@index([categoryId, isActive])
+  @@map("products")
+}
+
+// The Product → Service → Provider link. A product can accumulate several
+// ProviderService rows over its life (old ones deactivated, not deleted —
+// StoreOrder rows reference them and must never dangle) but exactly ONE
+// should be `isActive` at a time; that is the one actually offered/used.
+model ProviderService {
+  id              BigInt   @id @default(autoincrement())
+  productId       BigInt   @map("product_id")
+  providerId      BigInt   @map("provider_id")
+  // The PROVIDER's own identifier for this exact product/package (a SKU/plan
+  // code their API expects) — opaque to us, passed straight through in
+  // createOrder()'s metadata. Never assumed/invented for a real provider
+  // without their documentation.
+  providerSkuCode String   @db.VarChar(64) @map("provider_sku_code")
+  priceAssetCode  String   @db.VarChar(16) @map("price_asset_code")
+  priceAmount     String   @db.VarChar(64) @map("price_amount") // decimal string — the SALE price users pay; always (re)computed by PricingService
+  // ── pricing inputs (all optional) ──
+  // Sale price = manualPrice if set, else cost + margin, else priceAmount as-is. An admin never has to set a
+  // price per product: bulk-apply a margin to many products, or override single ones.
+  costAmount      String?  @map("cost_amount") @db.VarChar(64)   // supplier's price to us (synced)
+  costAssetCode   String?  @map("cost_asset_code") @db.VarChar(16)
+  marginType      String?  @map("margin_type") @db.VarChar(8)    // PERCENT | FIXED
+  marginValue     String?  @map("margin_value") @db.VarChar(32)
+  manualPrice     String?  @map("manual_price") @db.VarChar(64)
+  externalName    String?  @map("external_name")                 // the supplier's own product name
+  supplierStock   Boolean  @default(true) @map("supplier_stock")
+  lastSyncedAt    DateTime? @map("last_synced_at")
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  product  Product      @relation(fields: [productId], references: [id], onDelete: Restrict)
+  provider Provider     @relation(fields: [providerId], references: [id], onDelete: Restrict)
+  orders   StoreOrder[]
+
+  @@index([productId, isActive])
+  @@map("provider_services")
+}
+
+enum StoreOrderStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+// One row per purchase, EVER — never re-executed for the same idempotency
+// key (§11: "يجب منع تنفيذ الطلب مرتين حتى لو حصل Refresh أو تكرار Request").
+model StoreOrder {
+  id                BigInt           @id @default(autoincrement())
+  publicId          String           @unique @default(uuid()) @map("public_id")
+  userId            BigInt           @map("user_id")
+  productId         BigInt           @map("product_id")
+  providerServiceId BigInt           @map("provider_service_id")
+  status            StoreOrderStatus @default(PENDING)
+  quantity          Int              @default(1)
+  assetCode         String           @db.VarChar(16) @map("asset_code")
+  amount            String           @db.VarChar(64) // decimal — snapshotted at order time (price × quantity), immune to later price changes
+  fee               String           @db.VarChar(64) @default("0")
+  idempotencyKey    String           @unique @map("idempotency_key")
+  providerOrderId   String?          @db.VarChar(128) @map("provider_order_id")
+  providerResponse  Json?            @map("provider_response")
+  transactionId     BigInt?          @unique @map("transaction_id") // the ledger Transaction (type=ORDER) that moved the money
+  metadata          Json?            // product-specific purchase params (e.g. target game id, target phone number)
+  createdAt         DateTime         @default(now()) @map("created_at")
+  updatedAt         DateTime         @updatedAt @map("updated_at")
+
+  user            User            @relation(fields: [userId], references: [id], onDelete: Restrict)
+  product         Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  providerService ProviderService @relation(fields: [providerServiceId], references: [id], onDelete: Restrict)
+  transaction     Transaction?    @relation(fields: [transactionId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@map("store_orders")
+}
+
+// ─────────────────────────────────────────────────────────────
+// CONTENT / SITE / MEDIA / FX  (admin-managed)
+// ─────────────────────────────────────────────────────────────
+
+enum PostKind {
+  NEWS
+  OFFER
+}
+
+enum PostStatus {
+  DRAFT
+  PUBLISHED
+}
+
+model NewsPost {
+  id          BigInt     @id @default(autoincrement())
+  publicId    String     @unique @default(uuid()) @map("public_id")
+  kind        PostKind   @default(NEWS)
+  status      PostStatus @default(DRAFT)
+  title       String
+  excerpt     String?    @db.VarChar(500)
+  body        String     @db.Text
+  imageUrl    String?    @map("image_url") @db.VarChar(512)
+  publishedAt DateTime?  @map("published_at")
+  authorId    BigInt?    @map("author_id")
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+
+  @@index([kind, status, publishedAt])
+  @@map("news_posts")
+}
+
+// Key/value site configuration edited from the admin panel: login-page images, withdrawal limits,
+// social links ... Values are JSON; keys are namespaced ("login.images", "withdraw.limits").
+model SiteSetting {
+  key       String   @id @db.VarChar(100)
+  value     Json
+  updatedBy BigInt?  @map("updated_by")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("site_settings")
+}
+
+// Uploaded images. The file lives on disk under UPLOAD_DIR with a random name; only raster types are accepted
+// (no SVG — it can carry script).
+model MediaAsset {
+  id         BigInt   @id @default(autoincrement())
+  publicId   String   @unique @default(uuid()) @map("public_id")
+  fileName   String   @unique @map("file_name") @db.VarChar(80)
+  mime       String   @db.VarChar(40)
+  sizeBytes  Int      @map("size_bytes")
+  uploadedBy BigInt?  @map("uploaded_by")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@map("media_assets")
+}
+
+// Admin-set conversion rate: 1 unit of fromAssetCode = `rate` units of toAssetCode (decimal string).
+// Used by ConversionService (e.g. USDT → VYR_SCS so a crypto deposit can be withdrawn to Sham Cash / Syriatel).
+model ExchangeRate {
+  id            BigInt   @id @default(autoincrement())
+  fromAssetCode String   @map("from_asset_code") @db.VarChar(16)
+  toAssetCode   String   @map("to_asset_code") @db.VarChar(16)
+  rate          String   @db.VarChar(32)
+  isActive      Boolean  @default(true) @map("is_active")
+  updatedBy     BigInt?  @map("updated_by")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@unique([fromAssetCode, toAssetCode])
+  @@map("exchange_rates")
+}
+
+
+// ── Identity verification (KYC) ──
+enum KycStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum KycDocType {
+  ID_CARD
+  PASSPORT
+  DRIVING_LICENSE
+}
+
+/// Images live in a PRIVATE folder (never served by the public /media route); only reviewers with
+/// permission kyc.review can read them, through an authenticated endpoint. The document number is stored encrypted.
+model KycSubmission {
+  id             BigInt     @id @default(autoincrement())
+  publicId       String     @unique @default(uuid()) @map("public_id")
+  userId         BigInt     @map("user_id")
+  status         KycStatus  @default(PENDING)
+  fullName       String     @map("full_name") @db.VarChar(191)
+  docType        KycDocType @map("doc_type")
+  docNumberEnc   String     @map("doc_number_enc") @db.Text
+  docNumberLast4 String     @map("doc_number_last4") @db.VarChar(8)
+  frontFile      String     @map("front_file") @db.VarChar(64)
+  backFile       String?    @map("back_file") @db.VarChar(64)
+  selfieFile     String     @map("selfie_file") @db.VarChar(64)
+  reviewNote     String?    @map("review_note") @db.VarChar(500)
+  reviewedBy     BigInt?    @map("reviewed_by")
+  reviewedAt     DateTime?  @map("reviewed_at")
+  createdAt      DateTime   @default(now()) @map("created_at")
+  updatedAt      DateTime   @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, status])
+  @@index([status, createdAt])
+  @@map("kyc_submissions")
+}

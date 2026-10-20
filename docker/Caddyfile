@@ -1,0 +1,13 @@
+# SITE_ADDRESS غير مضبوط => http على المنفذ 80. ضع دومين (مثل vayro.example.com) فيحصل HTTPS تلقائياً.
+{$SITE_ADDRESS::80} {
+	encode gzip
+	request_body {
+		max_size 10MB
+	}
+	handle /api/* {
+		reverse_proxy api:3000
+	}
+	handle {
+		reverse_proxy web:3001
+	}
+}

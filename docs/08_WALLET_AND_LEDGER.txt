@@ -1,0 +1,113 @@
+VAYRO — 08_WALLET_AND_LEDGER.txt
+===================================
+Phase 3. لا يوجد بعد أي تحويل بين مستخدمين (Internal Transfers هي Phase 4) ولا أي
+مزود إيداع حقيقي (USDT/Sham Cash/Syriatel هي Phase 5+). هذا الملف يوثّق فقط
+البنية التحتية الأساسية للمحفظة والدفتر المحاسبي (Ledger) التي ستُبنى فوقها كل
+هذه العمليات لاحقًا دون تعديلها.
+
+────────────────────────────────────────
+1. طبقات المسؤولية (لا يجوز تجاوزها)
+────────────────────────────────────────
+LedgerService  → المكان الوحيد المسموح له بالكتابة في ledger_accounts.balance_minor
+                 و ledger_entries. لا وحدة أخرى تكتب في هاتين الجدولين مباشرة.
+WalletService  → المكان الوحيد المسموح له بالكتابة في wallets/wallet_accounts.
+                 كل عملية تُحرّك قيمة فعلية (credit/debit/settle) تُفوِّض الترحيل
+                 المحاسبي الفعلي لـ LedgerService ضمن نفس معاملة قاعدة البيانات.
+TransactionsService → المكان الوحيد المسموح له بتغيير transactions.status، عبر
+                 جدول انتقالات صريح (transaction-state-machine.ts) — لا يوجد أي
+                 "setter" عام لهذا الحقل في أي مكان آخر بالكود.
+
+هذا الفصل الثلاثي هو ما يضمن أن أي وحدة مستقبلية (Transfers, Orders, Deposits)
+لا يمكنها كتابة رصيد أو تغيير حالة معاملة بشكل مباشر ومخالف — فقط عبر هذه الواجهات.
+
+────────────────────────────────────────
+2. Ledger — Double-Entry حقيقي
+────────────────────────────────────────
+- كل ledger_account له balance_minor (BigInt) — رصيد جارٍ موثوق، مُحدَّث فقط داخل
+  LedgerService.postEntry تحت قفل صف (`SELECT ... FOR UPDATE`) لمنع أي Race Condition
+  عند تزامن عمليتين على نفس الحساب.
+- كل ledger_entry مرتبط بـ ledger_account واحد + transaction واحد، وله balance_after
+  محسوب من نفس القفل — يسمح بإعادة بناء أي رصيد تاريخيًا بجمع القيود من الصفر
+  عند الحاجة للتدقيق، دون الاعتماد فقط على الحقل المُخزَّن.
+- postEntry يرفض أي DEBIT يجعل الرصيد سالبًا (ConflictException: INSUFFICIENT_BALANCE)
+  — هذا الرفض يحدث داخل معاملة قاعدة البيانات فتُلغى العملية بأكملها تلقائيًا.
+- postPair: قيد مزدوج متوازن (DEBIT من حساب + CREDIT لحساب آخر بنفس القيمة) —
+  الأداة التي ستستخدمها Transfers (Phase 4) لاحقًا للتحويل بين مستخدمين.
+
+────────────────────────────────────────
+3. Wallet — AVAILABLE / HELD (مطابق لمواصفات Phase 2)
+────────────────────────────────────────
+كل wallet_account له عمودان: available_minor و held_minor. خمس عمليات فقط:
+
+- credit(userId, asset, amount, txId)  → available += amount + قيد CREDIT في الـLedger.
+  (تُستخدم لاحقًا للإيداعات الحقيقية Phase 6+، وحاليًا فقط عبر سكربت الاختبار
+  dev-credit-wallet.ts — انظر القسم 5.)
+- debit(userId, asset, amount, txId)   → available -= amount + قيد DEBIT في الـLedger.
+  (لعمليات فورية بلا مرحلة "معلّقة" — مثال مستقبلي: رسوم تُخصَم لحظيًا.)
+- hold(userId, asset, amount)          → available -= amount، held += amount.
+  **لا قيد Ledger هنا** — المال لم يغادر المستخدم فعليًا، فقط أصبح غير قابل للإنفاق
+  مكان آخر (مثال Phase 2: طلب سحب/تحويل بحالة PENDING بانتظار تأكيد Provider).
+- release(userId, asset, amount)       → held -= amount، available += amount.
+  (تراجع عن hold — مثال: فشل الطلب أو أُلغي.)
+- settle(userId, asset, amount, txId)  → held -= amount نهائيًا + قيد DEBIT في الـLedger.
+  (المال غادر المستخدم فعليًا الآن — مثال: تأكد نجاح السحب لدى Provider.)
+
+هذا يطابق تمامًا المثال الوارد في تعليمات Phase 2:
+  1000 AVAILABLE → hold 500 → 500 AVAILABLE / 500 HELD
+  نجاح  → settle 500 → 500 AVAILABLE / 0 HELD (المبلغ غادر فعليًا)
+  فشل   → release 500 → 1000 AVAILABLE (عاد كما كان)
+
+wallet_account تُنشأ بشكل كسول (lazy) — لا يُنشأ صف لكل أصل عند التسجيل، فقط عند
+أول عملية فعلية تحتاجه (getOrCreateWalletAccount). الـ Wallet نفسها (الحاوية) تُنشأ
+فور التسجيل عبر حدث `user.registered` الذي يُطلقه AuthService ويستمع له WalletService
+— هذا يبقي Auth غير متصل مباشرة بمنطق Wallet/Ledger الداخلي (@nestjs/event-emitter).
+
+────────────────────────────────────────
+4. Transactions — State Machine المُفعَّلة فعليًا
+────────────────────────────────────────
+الانتقالات المسموحة فقط (transaction-state-machine.ts):
+  PENDING    → PROCESSING | CANCELLED
+  PROCESSING → COMPLETED | FAILED
+  COMPLETED  → REFUNDING
+  FAILED     → REFUNDING
+  REFUNDING  → REFUNDED
+  CANCELLED, REFUNDED: حالات نهائية، لا انتقال منها.
+أي محاولة انتقال خارج هذا الجدول تُرمى كـ InvalidTransitionError فورًا.
+
+createIdempotent: إنشاء transaction مرتبط بـ idempotency_key فريد على مستوى
+قاعدة البيانات (وليس فقط تحقق بالكود). عند تكرار نفس المفتاح (طلب مكرر، Webhook
+مكرر لاحقًا) تُعاد نفس المعاملة الموجودة بدل الفشل أو التكرار — wasAlreadyProcessed:true
+يُخبر المستدعي أن هذه إعادة تشغيل idempotent وليست عملية جديدة.
+
+────────────────────────────────────────
+5. أداة الاختبار (dev-credit-wallet) — ليست HTTP endpoint عمدًا
+────────────────────────────────────────
+لا يوجد أي مزود إيداع حقيقي بعد (USDT custody وSham Cash/Syriatel قادمة Phase 5+).
+لاختبار محفظة بأرصدة تجريبية الآن، استخدم سكربت CLI فقط (وليس أي مسار API مكشوف
+على الشبكة، تجنبًا لأي سطح هجوم من نوع "أموال مجانية"):
+
+  cd apps/api
+  npm run dev:credit-wallet -- <username> <ASSET_CODE> <amount>
+  مثال: npm run dev:credit-wallet -- ahmad_test USDT 100
+
+يرفض العمل إن كان NODE_ENV=production. يمرّ بنفس WalletService/LedgerService/
+TransactionsService الحقيقية بالكامل — أي أنه يختبر المنطق الفعلي، وليس اختصارًا
+وهميًا حوله.
+
+────────────────────────────────────────
+6. Endpoint المتاح الآن
+────────────────────────────────────────
+GET /api/v1/wallet/me — محمي بـ JWT، يعيد أرصدة المستخدم الحالي (available/held)
+لكل أصل لديه حساب فيه فعليًا. مصدر المستخدم دائمًا من التوكن المُتحقَّق منه
+(نفس نمط IDOR-safe المستخدم في /users/me).
+
+────────────────────────────────────────
+7. غير مُنفَّذ بعد (بصراحة — تعمّدًا خارج نطاق Phase 3)
+────────────────────────────────────────
+- Internal Transfers بين مستخدمين عبر @username (Phase 4) — LedgerService.postPair
+  جاهزة كأداة، لكن لا Controller/Service يستخدمها بعد لتحويل فعلي بين مستخدمين.
+- أي Provider حقيقي للإيداع/السحب (Phase 5+).
+- Fees على أي عملية (لا FeeCalculator مربوط بأي تدفق فعلي بعد رغم وجوده كأداة
+  جاهزة من Phase 2).
+- أي واجهة مستخدم (Frontend) لعرض الرصيد الفعلي — /dashboard في الواجهة لا يزال
+  Placeholder ثابتًا ($0.00) ولم يُربَط بـ GET /wallet/me بعد.

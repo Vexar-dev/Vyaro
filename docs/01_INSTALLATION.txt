@@ -1,0 +1,81 @@
+VAYRO — 01_INSTALLATION.txt
+============================
+Phase 2 status: Auth + Users + Sessions + RBAC are implemented and migratable.
+Wallet/Ledger tables exist in the schema but have no business logic wired yet
+(Phase 3). Provider integrations are placeholders only (Phase 5+).
+
+────────────────────────────────────────
+1. المتطلبات (Requirements)
+────────────────────────────────────────
+- Node.js 20.x LTS
+- npm 10.x
+- MySQL 8.0+ (InnoDB)
+- Redis 7.x
+- Docker + Docker Compose (اختياري لكن موصى به، انظر 04_DOCKER_SETUP.txt)
+- OpenSSL (لتوليد الأسرار محليًا: JWT secrets, ENCRYPTION_KEY)
+
+────────────────────────────────────────
+2. التثبيت بدون Docker
+────────────────────────────────────────
+  # من جذر المشروع
+  npm install                      # يثبّت apps/api و apps/web عبر npm workspaces
+
+  cp .env.example .env
+  # افتح .env وولّد الأسرار:
+  openssl rand -hex 32             # الصق الناتج في JWT_ACCESS_SECRET
+  openssl rand -hex 32             # الصق الناتج في JWT_REFRESH_SECRET
+  openssl rand -hex 32             # الصق الناتج في ENCRYPTION_KEY
+
+  # تأكد من تشغيل MySQL و Redis محليًا وأن DATABASE_URL/REDIS_URL في .env صحيحة
+
+  cd apps/api
+  npx prisma generate
+  npx prisma migrate deploy        # يطبّق migration.sql الموجودة في prisma/migrations
+  npm run prisma:seed              # NODE_ENV=development فقط — بيانات تطوير غير حقيقية
+
+  npm run start:dev                # يشغّل API على http://localhost:3000/api/v1
+
+  # في نافذة طرفية أخرى
+  cd apps/web
+  npm run dev                      # يشغّل الواجهة على http://localhost:3001
+
+────────────────────────────────────────
+3. التثبيت عبر Docker
+────────────────────────────────────────
+  cp .env.example .env
+  # ولّد الأسرار كما في الأعلى ثم عدّل .env
+
+  docker compose -f docker/docker-compose.yml up -d
+  docker compose -f docker/docker-compose.yml exec api npx prisma migrate deploy
+  docker compose -f docker/docker-compose.yml exec api npm run prisma:seed
+
+  # تحقق من الصحة:
+  curl http://localhost:3000/api/v1/health
+
+────────────────────────────────────────
+4. أوامر مفيدة
+────────────────────────────────────────
+  npm run api:build      # بناء الإنتاج للـ API
+  npm run api:test       # تشغيل الاختبارات (Jest)
+  npm run docker:up      # تشغيل docker compose
+  npm run docker:down    # إيقاف docker compose
+
+────────────────────────────────────────
+5. Troubleshooting
+────────────────────────────────────────
+- "Invalid environment configuration" عند الإقلاع:
+    أحد متغيرات .env مفقود أو قصير جدًا (JWT_*_SECRET وENCRYPTION_KEY يجب أن تكون
+    32 حرفًا على الأقل). راجع src/config/env.validation.ts.
+
+- "P1001: Can't reach database server" من Prisma:
+    تأكد أن حاوية/خدمة MySQL تعمل فعليًا وأن DATABASE_URL يطابق بيانات .env
+    (المستخدم غير root — انظر 04_DOCKER_SETUP.txt).
+
+- تسجيل الدخول يفشل دائمًا برسالة عامة:
+    هذا متعمّد (INVALID_CREDENTIALS لا تكشف إن كان الحساب موجودًا). تحقق من كلمة
+    المرور والبريد/اسم المستخدم، أو من أن الحساب ليس مقفلًا (locked_until).
+
+- ملاحظة بيئة التطوير الحالية (سياق توليد هذا المشروع):
+    هذا التسليم أُنتج داخل بيئة sandbox بلا اتصال شبكة، لذلك لم يُشغَّل فيها
+    npm install/build/test فعليًا ولا تم الاتصال بقاعدة بيانات حقيقية. نفّذ
+    الخطوات أعلاه محليًا للتحقق قبل الاعتماد على المشروع.
